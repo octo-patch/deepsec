@@ -18,6 +18,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+  attributionHeaders,
   backoff,
   buildInvestigateJsonRepairPrompt,
   buildInvestigatePrompt,
@@ -50,6 +51,7 @@ import type {
   RevalidateParams,
   RevalidateRawResponse,
   RevalidateVerdict,
+  SetupTaskParams,
 } from "./types.js";
 
 const DEFAULT_MODEL = "zai/glm-5.2";
@@ -78,6 +80,7 @@ interface PiAgentConfig {
   aiBaseUrl?: string;
   aiApiKeyEnv?: string;
   aiHeaders?: Record<string, string>;
+  aiCredentialHeader?: { name: string; scheme: "bearer" | "raw" };
   thinkingLevel?: string;
 }
 
@@ -86,11 +89,8 @@ type PiProviderConfig = Parameters<ModelRegistry["registerProvider"]>[1];
 type PiProviderModelConfig = NonNullable<PiProviderConfig["models"]>[number];
 
 // MiniMax exposes an OpenAI-compatible endpoint on two regional hosts that
-// share the same model catalog. We register the provider so `--model
-// minimax/<id>` resolves offline (deepsec pins PI_OFFLINE, so pi never
-// fetches a remote catalog for it). The region is selected with
-// MINIMAX_REGION, or overridden outright with MINIMAX_BASE_URL /
-// --ai-base-url; the model ids stay stable across regions.
+// share the same model catalog. Registering the provider locally keeps model
+// resolution offline; the selected route is still used by Pi at request time.
 const MINIMAX_PROVIDER = "minimax";
 const MINIMAX_API = "openai-completions" as const;
 const MINIMAX_REGION_BASE_URLS = {
@@ -101,33 +101,33 @@ type MiniMaxRegion = keyof typeof MINIMAX_REGION_BASE_URLS;
 const MINIMAX_DEFAULT_REGION: MiniMaxRegion = "global";
 // Output cap applied on the deepsec side; matches the generic pass-through
 // default. deepsec's investigation JSON fits well under this.
-const MINIMAX_MAX_TOKENS = 32_000;
+const MINIMAX_FLASH_MAX_TOKENS = 524_288;
+const MINIMAX_DEEPSEC_MAX_TOKENS = 32_000;
 
-// Built-in model presets. cost is USD per million tokens (pi divides usage
-// by 1e6). `reasoning: true` routes deepsec's --thinking-level through to
-// each model: MiniMax-M3's thinking is adaptive and can be turned down for
-// cheaper waves, while MiniMax-M2.7 always reasons. pi's `input` union
-// covers only text/image, so the video modality is not represented here.
+// Costs are USD per million tokens, matching pi's provider model contract.
+// Pi only exposes text/image input labels; the MiniMax API's video capability
+// remains outside this text-agent integration.
 const MINIMAX_MODELS: PiProviderModelConfig[] = [
+  {
+    id: "MiniMax-M3.1-Flash",
+    name: "MiniMax-M3.1-Flash",
+    api: MINIMAX_API,
+    reasoning: true,
+    thinkingLevelMap: { xhigh: "max" },
+    input: ["text", "image"],
+    cost: { input: 0.15, output: 0.6, cacheRead: 0.015, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: MINIMAX_FLASH_MAX_TOKENS,
+  },
   {
     id: "MiniMax-M3",
     name: "MiniMax-M3",
     api: MINIMAX_API,
     reasoning: true,
     input: ["text", "image"],
-    cost: { input: 0.6, output: 2.4, cacheRead: 0.12, cacheWrite: 0 },
+    cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0 },
     contextWindow: 1_000_000,
-    maxTokens: MINIMAX_MAX_TOKENS,
-  },
-  {
-    id: "MiniMax-M2.7",
-    name: "MiniMax-M2.7",
-    api: MINIMAX_API,
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0.3, output: 1.2, cacheRead: 0.06, cacheWrite: 0.375 },
-    contextWindow: 204_800,
-    maxTokens: MINIMAX_MAX_TOKENS,
+    maxTokens: MINIMAX_DEEPSEC_MAX_TOKENS,
   },
 ];
 
@@ -351,6 +351,10 @@ function readConfig(config: Record<string, unknown>): PiAgentConfig {
       config.aiHeaders && typeof config.aiHeaders === "object" && !Array.isArray(config.aiHeaders)
         ? (config.aiHeaders as Record<string, string>)
         : undefined,
+    aiCredentialHeader:
+      config.aiCredentialHeader && typeof config.aiCredentialHeader === "object"
+        ? (config.aiCredentialHeader as { name: string; scheme: "bearer" | "raw" })
+        : undefined,
     thinkingLevel: typeof config.thinkingLevel === "string" ? config.thinkingLevel : undefined,
   };
 }
@@ -417,7 +421,18 @@ async function configureRuntimeAuth(runtime: ModelRuntime, cfg: PiAgentConfig): 
   }
 }
 
-function configureProviderOverrides(registry: ModelRegistry, cfg: PiAgentConfig): void {
+/** Exported for tests. */
+export function configureProviderOverrides(registry: ModelRegistry, cfg: PiAgentConfig): void {
+  // App Attribution for every request the gateway provider serves,
+  // including models from pi's builtin vercel-ai-gateway catalog: a
+  // header-only extension registration merges over the builtin provider
+  // (its model catalog survives — pi only remaps models when the
+  // extension defines `models` or `baseUrl`), and the runtime folds
+  // extension headers into each request's assembled headers. Registered
+  // unconditionally: this provider only ever talks to the gateway host,
+  // so the headers can't leak to direct providers.
+  registry.registerProvider(GATEWAY_PROVIDER, { headers: attributionHeaders() });
+
   if (process.env.ANTHROPIC_BASE_URL) {
     registry.registerProvider("anthropic", { baseUrl: process.env.ANTHROPIC_BASE_URL });
   }
@@ -429,7 +444,15 @@ function configureProviderOverrides(registry: ModelRegistry, cfg: PiAgentConfig)
   if (!provider) return;
   const override: Parameters<ModelRegistry["registerProvider"]>[1] = {};
   if (cfg.aiBaseUrl) override.baseUrl = cfg.aiBaseUrl;
-  if (cfg.aiHeaders && Object.keys(cfg.aiHeaders).length > 0) override.headers = cfg.aiHeaders;
+  const headers = { ...(cfg.aiHeaders ?? {}) };
+  if (cfg.aiCredentialHeader && cfg.aiApiKeyEnv) {
+    const credential = process.env[cfg.aiApiKeyEnv];
+    if (credential) {
+      headers[cfg.aiCredentialHeader.name] =
+        cfg.aiCredentialHeader.scheme === "bearer" ? `Bearer ${credential}` : credential;
+    }
+  }
+  if (Object.keys(headers).length > 0) override.headers = headers;
   if (Object.keys(override).length > 0) {
     registry.registerProvider(provider, override);
   }
@@ -497,6 +520,10 @@ function registerGatewayModelIfNeeded(
     apiKey: getGatewayCredential() ?? "$AI_GATEWAY_API_KEY",
     api: GATEWAY_API,
     models,
+    // Re-registration merges over the attribution-only registration from
+    // configureProviderOverrides; repeat the headers so this call is
+    // correct standalone (tests construct registries without overrides).
+    headers: attributionHeaders(),
   });
 }
 
@@ -898,6 +925,35 @@ async function runToollessFollowUp(
   } finally {
     session.setActiveToolsByName(previousTools);
     if (signal) signal.removeEventListener("abort", abort);
+  }
+}
+
+export async function runPiSetupTask(params: SetupTaskParams): Promise<string> {
+  const cfg = readConfig(params.config);
+  const setup = await createPiSession(params.projectRoot, cfg);
+  try {
+    params.onProgress?.({
+      type: "started",
+      message: `Understanding repository with Pi (${setup.modelLabel})`,
+    });
+    const generator = runPiPrompt({
+      session: setup.session,
+      prompt: params.prompt,
+      label: "setup",
+      maxTurns: cfg.maxTurns ?? 40,
+      signal: params.signal,
+    });
+    let next = await generator.next();
+    while (!next.done) {
+      params.onProgress?.(next.value);
+      next = await generator.next();
+    }
+    const text = next.value.resultText.trim();
+    if (!text) throw new Error("Pi produced no setup result");
+    params.onProgress?.({ type: "complete", message: "Repository setup analysis complete" });
+    return text;
+  } finally {
+    setup.session.dispose();
   }
 }
 

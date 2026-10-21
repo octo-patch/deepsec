@@ -4,6 +4,7 @@ import path from "node:path";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  configureProviderOverrides,
   createPiReadOnlyToolDefinitions,
   registerMiniMaxProvider,
   resolvePiModelWithDynamicGateway,
@@ -74,6 +75,8 @@ describe("Pi model resolution", () => {
     "MINIMAX_API_KEY",
     "MINIMAX_BASE_URL",
     "MINIMAX_REGION",
+    "SAVED_MINIMAX_KEY",
+    "ACME_MODEL_KEY",
   ] as const;
   const originalEnv = Object.fromEntries(KEYS.map((key) => [key, process.env[key]]));
   const originalFetch = globalThis.fetch;
@@ -173,7 +176,49 @@ describe("Pi model resolution", () => {
     expect(called).toBe(false);
   });
 
-  it("registers the built-in MiniMax presets and resolves them offline", async () => {
+  it("registers App Attribution headers on the gateway provider", async () => {
+    const registry = await freshRegistry();
+    configureProviderOverrides(registry, {});
+    const config = registry.getRegisteredProviderConfig("vercel-ai-gateway");
+    expect(config?.headers).toMatchObject({
+      "http-referer": "https://deepsec.sh",
+    });
+    expect(config?.headers?.["x-title"]).toMatch(/^deepsec/);
+    // Header-only extension registration must not clobber the builtin
+    // catalog — gateway models keep resolving.
+    process.env.AI_GATEWAY_API_KEY = "vck_test";
+    const model = await resolvePiModelWithDynamicGateway(registry, "google/gemini-3.6-flash", {});
+    expect(model.provider).toBe("vercel-ai-gateway");
+  });
+
+  it("keeps attribution headers when the pass-through registration re-registers the provider", async () => {
+    process.env.AI_GATEWAY_API_KEY = "vck_test";
+    process.env.OPENAI_BASE_URL = "https://ai-gateway.vercel.sh/v1";
+    globalThis.fetch = async () => new Response(JSON.stringify({ data: [] }), { status: 200 });
+
+    const registry = await freshRegistry();
+    configureProviderOverrides(registry, {});
+    await resolvePiModelWithDynamicGateway(registry, "acme/nonexistent-model-1", {});
+    const config = registry.getRegisteredProviderConfig("vercel-ai-gateway");
+    expect(config?.headers?.["http-referer"]).toBe("https://deepsec.sh");
+  });
+
+  it("configures a persisted custom provider base URL and credential header", async () => {
+    process.env.ACME_MODEL_KEY = "secret";
+    const registry = await freshRegistry();
+    configureProviderOverrides(registry, {
+      aiProvider: "acme",
+      aiBaseUrl: "https://models.acme.test/v1",
+      aiApiKeyEnv: "ACME_MODEL_KEY",
+      aiCredentialHeader: { name: "x-api-key", scheme: "raw" },
+    });
+    expect(registry.getRegisteredProviderConfig("acme")).toMatchObject({
+      baseUrl: "https://models.acme.test/v1",
+      headers: { "x-api-key": "secret" },
+    });
+  });
+
+  it("registers the Flash-first MiniMax presets and resolves them offline", async () => {
     for (const key of KEYS) delete process.env[key];
     let called = false;
     globalThis.fetch = async () => {
@@ -184,20 +229,27 @@ describe("Pi model resolution", () => {
     const registry = await freshRegistry();
     registerMiniMaxProvider(registry, {});
 
+    const flash = await resolvePiModelWithDynamicGateway(
+      registry,
+      "minimax/MiniMax-M3.1-Flash",
+      {},
+    );
+    expect(flash.provider).toBe("minimax");
+    expect(flash.id).toBe("MiniMax-M3.1-Flash");
+    expect(flash.api).toBe("openai-completions");
+    expect(flash.reasoning).toBe(true);
+    expect(flash.thinkingLevelMap).toEqual({ xhigh: "max" });
+    expect(flash.input).toEqual(["text", "image"]);
+    expect(flash.contextWindow).toBe(1_000_000);
+    expect(flash.maxTokens).toBe(524_288);
+    expect(flash.cost).toMatchObject({ input: 0.15, output: 0.6, cacheRead: 0.015 });
+
     const m3 = await resolvePiModelWithDynamicGateway(registry, "minimax/MiniMax-M3", {});
     expect(m3.provider).toBe("minimax");
     expect(m3.id).toBe("MiniMax-M3");
-    expect(m3.api).toBe("openai-completions");
-    expect(m3.reasoning).toBe(true);
-    expect(m3.input).toEqual(["text", "image"]);
     expect(m3.contextWindow).toBe(1_000_000);
-    expect(m3.cost.input).toBe(0.6);
-
-    const m27 = await resolvePiModelWithDynamicGateway(registry, "minimax/MiniMax-M2.7", {});
-    expect(m27.provider).toBe("minimax");
-    expect(m27.id).toBe("MiniMax-M2.7");
-    expect(m27.contextWindow).toBe(204_800);
-    expect(m27.cost.cacheWrite).toBe(0.375);
+    expect(m3.thinkingLevelMap).toBeUndefined();
+    expect(m3.cost).toMatchObject({ input: 0.3, output: 1.2, cacheRead: 0.06 });
 
     expect(called).toBe(false);
   });
@@ -234,5 +286,50 @@ describe("Pi model resolution", () => {
     expect(registry.getRegisteredProviderConfig("minimax")?.baseUrl).toBe(
       "https://example.test/v1",
     );
+  });
+
+  it("keeps a saved custom MiniMax model route and key override intact", async () => {
+    for (const key of KEYS) delete process.env[key];
+    process.env.SAVED_MINIMAX_KEY = "saved-key";
+
+    const registry = await freshRegistry();
+    registerMiniMaxProvider(registry, {
+      model: "minimax/custom-saved",
+      aiProvider: "minimax",
+      aiBaseUrl: "https://saved.example/v1",
+      aiApiKeyEnv: "SAVED_MINIMAX_KEY",
+      aiHeaders: { "x-saved": "yes" },
+    });
+
+    expect(registry.getRegisteredProviderConfig("minimax")).toMatchObject({
+      baseUrl: "https://saved.example/v1",
+      apiKey: "saved-key",
+      headers: { "x-saved": "yes" },
+    });
+  });
+
+  it("keeps request discovery offline for MiniMax presets", async () => {
+    for (const key of KEYS) delete process.env[key];
+    process.env.MINIMAX_API_KEY = "fixture-key";
+    let called = false;
+    globalThis.fetch = async () => {
+      called = true;
+      throw new Error("network boundary must not be reached");
+    };
+
+    const registry = await freshRegistry();
+    registerMiniMaxProvider(registry, {});
+    const model = await resolvePiModelWithDynamicGateway(
+      registry,
+      "minimax/MiniMax-M3.1-Flash",
+      {},
+    );
+
+    expect(model.provider).toBe("minimax");
+    expect(registry.getRegisteredProviderConfig("minimax")).toMatchObject({
+      baseUrl: "https://api.minimax.io/v1",
+      apiKey: "fixture-key",
+    });
+    expect(called).toBe(false);
   });
 });
