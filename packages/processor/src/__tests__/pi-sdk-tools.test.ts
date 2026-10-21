@@ -308,6 +308,26 @@ describe("Pi model resolution", () => {
     });
   });
 
+  it("does not leak another provider's custom route or credential into MiniMax", async () => {
+    for (const key of KEYS) delete process.env[key];
+    process.env.ACME_MODEL_KEY = "acme-key";
+    process.env.MINIMAX_API_KEY = "minimax-key";
+
+    const registry = await freshRegistry();
+    registerMiniMaxProvider(registry, {
+      aiProvider: "acme",
+      aiBaseUrl: "https://models.acme.test/v1",
+      aiApiKeyEnv: "ACME_MODEL_KEY",
+      aiHeaders: { "x-acme": "yes" },
+    });
+
+    expect(registry.getRegisteredProviderConfig("minimax")).toMatchObject({
+      baseUrl: "https://api.minimax.io/v1",
+      apiKey: "minimax-key",
+    });
+    expect(registry.getRegisteredProviderConfig("minimax")?.headers).toBeUndefined();
+  });
+
   it("keeps request discovery offline for MiniMax presets", async () => {
     for (const key of KEYS) delete process.env[key];
     process.env.MINIMAX_API_KEY = "fixture-key";

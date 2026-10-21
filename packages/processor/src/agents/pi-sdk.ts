@@ -131,8 +131,12 @@ const MINIMAX_MODELS: PiProviderModelConfig[] = [
   },
 ];
 
+function isMiniMaxRoute(cfg: PiAgentConfig): boolean {
+  return (cfg.aiProvider ?? modelProviderFromName(cfg.model)) === MINIMAX_PROVIDER;
+}
+
 function resolveMiniMaxBaseUrl(cfg: PiAgentConfig): string {
-  if (cfg.aiBaseUrl) return cfg.aiBaseUrl;
+  if (cfg.aiBaseUrl && isMiniMaxRoute(cfg)) return cfg.aiBaseUrl;
   if (process.env.MINIMAX_BASE_URL) return process.env.MINIMAX_BASE_URL;
   const region = process.env.MINIMAX_REGION as MiniMaxRegion | undefined;
   if (region && region in MINIMAX_REGION_BASE_URLS) return MINIMAX_REGION_BASE_URLS[region];
@@ -151,9 +155,13 @@ export function registerMiniMaxProvider(registry: ModelRegistry, cfg: PiAgentCon
     api: MINIMAX_API,
     models: MINIMAX_MODELS,
   };
-  const key = cfg.aiApiKeyEnv ? process.env[cfg.aiApiKeyEnv] : process.env.MINIMAX_API_KEY;
+  const key = isMiniMaxRoute(cfg) && cfg.aiApiKeyEnv
+    ? process.env[cfg.aiApiKeyEnv]
+    : process.env.MINIMAX_API_KEY;
   if (key) override.apiKey = key;
-  if (cfg.aiHeaders && Object.keys(cfg.aiHeaders).length > 0) override.headers = cfg.aiHeaders;
+  if (isMiniMaxRoute(cfg) && cfg.aiHeaders && Object.keys(cfg.aiHeaders).length > 0) {
+    override.headers = cfg.aiHeaders;
+  }
   registry.registerProvider(MINIMAX_PROVIDER, override);
 }
 
